@@ -1,0 +1,119 @@
+---
+title: "data in Rmarkdown tests"
+author: "David M. Kaplan"
+date: "3/27/2020"
+output: 
+  pdf_document:
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+This document contains a proof of concept for adding data engines to Rmarkdown that would allow placing data directly inside Rmarkdown documents to create completely self-contained Rmarkdown documents. It currently implements two language engines:
+
+1) **csv**: csv data
+2) **base64RDS**: an RDS file that has been base64 encoded
+
+The implementation is quite simple, but works. I am not sure if it is best to create these two data engines or create a single data engine `data`, which would have chunk options describing the encoding and data type. If the latter option is preferable, then the code below can be rapidly adapted to that format.
+
+# Implementation of language engines
+
+```{r data_engines}
+eng_csv = function(options) {
+  vn = options$output.var
+  if (is.null(vn))
+    stop("output.var must be supplied in CSV chunk.")
+    
+  csvops = options$csv.options
+  
+  if (is.null(csvops))
+    csvops = list()
+  
+  csvops$header=ifelse(is.null(options$header),TRUE,options$header)
+  csvops$sep=ifelse(is.null(options$sep),',',options$sep)
+  csvops$stringsAsFactors=ifelse(is.null(options$stringsAsFactors),FALSE,
+                                 options$stringsAsFactors)
+  
+  tf = tempfile("eng_csv")
+  writeLines(text=options$code,con=tf)
+  csvops$file = tf
+  
+  data = do.call(read.csv,csvops)
+  
+  assign(vn, data, envir = knitr::knit_global())
+  
+  options$csv.options=csvops
+  
+  #options$echo=FALSE
+  
+  knitr::engine_output(options,options$code,'')
+}
+
+knitr::knit_engines$set(csv=eng_csv)
+
+eng_base64RDS = function(options) {
+  vn = options$output.var
+  if (is.null(vn))
+    stop("output.var must be supplied in base64RDS chunk.")
+  
+  b64 = paste(trimws(options$code,"both"),collapse="")
+
+  tf = tempfile("eng_base64RDS")
+
+  require(base64enc)
+  x = base64enc::base64decode(b64)
+  writeBin(x,con=tf)
+  data=readRDS(tf)
+  assign(vn, data, envir = knitr::knit_global())
+  
+  #options$echo=FALSE
+  
+  knitr::engine_output(options,options$code,'')
+}
+
+knitr::knit_engines$set(base64RDS=eng_base64RDS)
+```
+
+# Test of csv chunk
+
+```{csv t1,output.var="t1"}
+id,res
+1,a
+2,b
+3,c
+```
+
+```{r}
+t1
+```
+
+# Test of base64RDS chunk
+
+```{base64RDS t2,output.var="t2"}
+H4sIAAAAAAAAA4vgYmBgYGZgZgNiViCTgTU0xE3XgoGBSRjI
+YQLid1CakYGFgRNI8yXn5xYkJpfEZ+aVFKcWosmyJCUWp0LF
+eMHiEPofSCfIKgcVBjCw/4BKQ9UIIJnFnJiUDDQR2XjWvMTc
+1GKoOiaoIGMijJEEMgUAP3IVTdMAAAA=
+```
+
+```{r}
+names(t2)
+t2
+```
+
+# How to create a base64 encoded text file in R
+
+```{r}
+saveRDS(t2,"test_csv.RDS")
+
+library(base64enc)
+txt = base64encode("test_csv.RDS",60)
+writeLines(txt,con = "test_csv.base64RDS")
+
+readLines("test_csv.base64RDS")
+```
+
