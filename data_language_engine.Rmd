@@ -364,7 +364,7 @@ data_encode("test.RDS","gpg",options=list(receiver=id))
 id = gpg::gpg_list_keys("test@test.org")$id
 data_encode("test.RDS","gpg",options=list(receiver=id),output="test.gpg")
 cat(readLines("test.gpg"),sep="\n")
-#file.remove("test.gpg")
+file.remove("test.gpg")
 ```
 
 
@@ -3428,7 +3428,7 @@ rasterImage(img,1,1,2,2)
 
 # Remove imported key
 
-I am cleaning up by removing the imported GPG key.
+I am cleaning up by removing the imported GPG key. The keyring management software may ask you about this before doing it.
 
 ```{r deletekey,eval=TRUE}
 id = gpg::gpg_list_keys("test@test.org")$id
