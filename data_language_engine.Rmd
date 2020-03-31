@@ -13,15 +13,13 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Overview
 
-This document contains a proof of concept for adding data engines to Rmarkdown that would allow placing data directly inside Rmarkdown documents to create completely self-contained Rmarkdown documents. The implementation is based on the idea that `data` chunks will contain the contents of the data files, potentially encoded as text using some encoding method.
+This document contains a proof of concept for adding a data language engine to Rmarkdown that allows placing data directly inside Rmarkdown documents to create completely self-contained Rmarkdown documents. The implementation is based on the idea that `data` chunks will contain the contents of the data files, potentially encoded as text using some encoding method.
 
-Though many types of data chunks are imaginable, I have currently implemented four: `text`, `csv`, `RDS` and a generic type where the `format` chunk option should be a loader function for loading in a file containing the decoded chunk data. For binary data chunks (e.g., `RDS`), the data must be encoded as text before inclusion in the chunk. Two different encodings are currently implemented: `base64` and `gpg`. If the `encoding` chunk option is not supplied, then `base64` is assumed, except for `text` and `csv` for which no encoding (i.e., `asis`) is assumed.
+Two generic `data` chunks formats are implemented: `text` and `binary`. Three encodings are currently implemented: `asis` (`text` only), `base64` (requires [base64enc](https://CRAN.R-project.org/package=base64enc) package) and `gpg` (requires [gpg](https://CRAN.R-project.org/package=gpg) package). Decoded data from a chunk must be assigned to a variable using the `output.var` chunk option and/or written to a file using the `output.file` chunk option.
 
-There is also a fifth format option, `file`, which returns a filename with the decoded chunk contents. `encoding` is assumed to be `base64` for this format if not explicitly specified.
+There is an `external.file` chunk option that allows one to specify the filename of an external text file that will be used as chunk contents. This is useful when initially developing a Rmarkdown file with `data` chunks to keep the file small and readable.
 
-I have included helper functions for simplifying encoding and decoding content using the methods described above. Encoding and decoding operations rely on the [base64enc](https://CRAN.R-project.org/package=base64enc) and [gpg](https://CRAN.R-project.org/package=gpg) R packages.
-
-Finally, there is an `external.file` chunk option that allows one to specify the filename of an external text file that will be used as chunk contents. This is useful when initially developing a Rmarkdown file with `data` chunks to keep the file small and readable.
+The implementation also includes helper functions `data_decode` and `data_encode`.
 
 The implementation is quite simple, but it works well. One potential drawback is that this could encourage creating Rmarkdown documents with large datasets inside that are unreadable. This could be prevented or discouraged by limiting the size of `data` chunks, perhaps with a chunk option to allow the user to violate size limits if they really want to.
 
@@ -29,63 +27,69 @@ The implementation is quite simple, but it works well. One potential drawback is
 
 ```{r data_engine}
 # Helper function to decode encoded text
-# Returns name of file where decoded text was saved
-data_decode = function(code,encoding,options,file=NULL) {
-  if (is.null(file))
-    file = tempfile()
+# If as_text=TRUE, then returns a character string
+# If as_text=FALSE, then returns a raw vector
+data_decode = function(data,encoding,as_text=FALSE,options=list()) {
+  if (!is.list(options))
+    stop("options must be a list.")
   
   switch(
     encoding,
-    asis = writeLines(code,file),
-    base64 = writeBin(base64enc::base64decode(code),file),
+    base64 = {
+     x = base64enc::base64decode(data)
+     if (as_text)
+       x = rawToChar(x)
+     x
+    },
     gpg = {
       tf = tempfile()
-      writeLines(code,tf)
+      writeLines(data,tf)
       on.exit(file.remove(tf))
-      writeBin(gpg::gpg_decrypt(tf,as_text=FALSE),file)
+      do.call(gpg::gpg_decrypt,c(data=tf,as_text=as_text,options))
     },
     stop("Uknown encoding: ",encoding)
   )
-  
-  return(file)
 }
 
 # Helper function to encode (typically) binary files for inclusion in data chunks
 # Silently returns encoded text. Encoded text is also spit out to console for 
 # copy-n-paste to Rmarkdown document. This can be surpressed by saving encoded text
 # to a file using output argument
-data_encode = function(file,encoding,options=list(base64.linewidth=64),output=NULL) {
-  code = switch(
+data_encode = function(file,encoding,options=list(),output=NULL) {
+  if (!is.list(options))
+    stop("options must be a list.")
+  
+  data = switch(
     encoding,
-    asis = readLines(file),
-    base64 = base64enc::base64encode(file,linewidth=options$base64.linewidth),
+    base64 = 
+      do.call(base64enc::base64encode,
+              c(what=file,options,linewidth=64,newline="\n")),
     gpg = {
       if (is.null(options$receiver))
-        stop("Missing GPG receiver. See ?gpg::gpg_encrypt for details.")
-      gpg::gpg_encrypt(file,options$receiver,options$signer)
+        stop("Missing GPG receiver in options list. See ?gpg::gpg_encrypt for details.")
+      do.call(gpg::gpg_encrypt,c(data=file,options))
     },
     stop("Uknown encoding: ",encoding)
   )
 
   if(is.null(output)) {
-    cat(code,sep="\n")
+    cat(data)
   } else {
-    writeLines(code,output)
+    writeLines(data,output)
   }
   
-  invisible(code)
+  invisible(data)
 }
 
 # Data engine itself
 eng_data = function(options) {
   output = ''
   
-  vn = options$output.var
-  if (is.null(vn))
-    stop("output.var must be supplied in data chunks.")
+  if (is.null(options$output.var) && is.null(options$output.file))
+    stop("One of output.var or output.file must be supplied in data chunk options.")
 
   code = options$code
-  
+
   # Option to include external file
   # Useful to keep initial file size small and readable.
   if (!is.null(options$external.file)) {
@@ -94,69 +98,45 @@ eng_data = function(options) {
     
     code = readLines(options$external.file)
   }
-  
+    
   format = options$format
   if (is.null(format))
     format = 'text'
+  if (!is.character(format) || !(format %in% c("text","binary")))
+    stop("format must be either 'text' or 'binary'.")
   
   encoding = options$encoding
   if (is.null(encoding)) {
     encoding = switch(
       format,
       text = 'asis',
-      csv = 'asis',
-      RDS = 'base64',
-      file = 'base64',
-      'base64'
+      binary = 'base64'
     )
   }
+  if (!is.character(encoding) || !(encoding %in% c("asis","base64","gpg")))
+    stop("encoding must be one of: 'asis', 'base64', 'gpg'.")
+  
+  decoding.ops = options$decoding.ops
+  if (is.null(decoding.ops))
+    decoding.ops = list()
+  if (!is.list(decoding.ops))
+    stop("decoding.ops should be a list. Got object of class ",class(decoding.ops)[1])
 
-  encoding.ops = options$encoding.ops
-  if (is.null(encoding.ops))
-    encoding.ops = list()
-  if (!is.list(encoding.ops))
-    stop("encoding.ops should be a list. Got object of class ",class(encoding.ops)[1])
-  
-  format.ops = options$format.ops
-  if (is.null(format.ops))
-    format.ops = list()
-  if (!is.list(format.ops))
-    stop("format.ops should be a list. Got object of class ",class(format.ops)[1])
-  
-  # If format=='text', just spit back code, possibly after splitting using a separator
-  if (is.character(format) && format=='text') {
-    orig_code = code
-    if (!is.null(format.ops$sep))
-      code = do.call(c,strsplit(code,format.ops$sep))
-    
-    assign(vn, code, envir = knitr::knit_global())
-    return(knitr::engine_output(options,orig_code,output))
+  if (encoding == "asis") {
+    data = paste(code,collapse=ifelse(is.null(options$newline),"\n",options$newline))
+  } else {
+    data = data_decode(code,encoding,as_text=(format=="text"),options=decoding.ops)
   }
-  
-  # In all other cases, decode data first
-  fn = data_decode(code,encoding,options=encoding.ops,
-                   file=format.ops$filename) # Allow writing to specific file
-  
-  # Except for `file` format, remove data file on exit
-  if (!is.character(format) || format!='file')
-    on.exit(file.remove(fn))
 
-  # If character format given, convert to a loader function
-  if (is.character(format)) {
-    format = switch(
-      format,
-      csv = read.csv,
-      RDS = readRDS,
-      file = function(file,...) file, # Return filename
-      get(format,mode="function") # Attempt format as function name
+  # Assign to output.var and/or write to file output.file 
+  if (!is.null(options$output.var))
+    assign(options$output.var, data, envir = knitr::knit_global())
+  if (!is.null(options$output.file))
+    switch(format,
+           text = writeLines(data,options$output.file),
+           binary = writeBin(data,options$output.file)
     )
-  } 
   
-  # Load data
-  data = do.call(format,c(file=fn,format.ops))
-  
-  # Assign to output.var and exit
-  assign(vn, data, envir = knitr::knit_global())
   knitr::engine_output(options,code,output)
 }
 
@@ -169,41 +149,31 @@ knitr::knit_engines$set(data=eng_data)
 Note that `format="text"` is optional as data chunks default to `text` if no format is specified.
 
 
-```{data t0,format="text",output.var="t0"}
+```{data t,output.var="t"}
 This is a text.
 It has two lines.
 ```
 
 ```{r}
-t0
-```
-
-## With separator
-
-```{data t00,format="text",output.var="t00",format.ops=list(sep=" ")}
-This is a text.
-It has two lines.
-```
-
-```{r}
-t00
+t
+cat(t)
 ```
 
 ## For numeric input
 
-```{data t000,format="text",output.var="t000",format.ops=list(sep=",")}
+```{data t1,output.var="t1"}
 1,2,3,4,5,6
 7,8,9
 ```
 
 ```{r}
-t000
-as.numeric(t000)
+x = as.numeric(strsplit(t1,"[,\n]")[[1]])
+x
 ```
 
-# Test of CSV chunk
+## For CSV data
 
-```{data t1,format="csv",output.var="t1"}
+```{data t2,output.var="t2"}
 id,res
 1,a
 2,b
@@ -211,12 +181,20 @@ id,res
 ```
 
 ```{r}
-t1
+x = read.csv(text=t2)
+x
 ```
 
-# Test of RDS chunk with base64 encoding
+# Test of binary chunk
 
-```{data t2,format="RDS",output.var="t2"}
+## RDS data with base64 encoding
+
+```{r}
+tf = tempfile()
+```
+
+
+```{data b1,format="binary",output.file=tf}
 H4sIAAAAAAAAA4vgYmBgYGZgZgNiViCTgTU0xE3XgoGBSRjI
 YQLid1CakYGFgRNI8yXn5xYkJpfEZ+aVFKcWosmyJCUWp0LF
 eMHiEPofSCfIKgcVBjCw/4BKQ9UIIJnFnJiUDDQR2XjWvMTc
@@ -224,11 +202,87 @@ eMHiEPofSCfIKgcVBjCw/4BKQ9UIIJnFnJiUDDQR2XjWvMTc
 ```
 
 ```{r}
-names(t2)
-t2
+readRDS(tf)
 ```
 
-# Test of GPG encrypted RDS chunk
+
+## PNG image with base64 encoding
+
+Note that `echo=FALSE` is essential for long data chunks.
+
+```{data myimage,echo=FALSE,format='binary',output.file="myimage.png"}
+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
+sidvx3Mx3AAAAABJRU5ErkJggg==
+```
+
+![Test image file](myimage.png) 
+
+**Note:** Knitting will fail if a temporary file is used for storing image chunk as the image file will be erased before document is passed to pandoc for formatting.
+
+# GPG encrypted binary data
 
 ## Import private key for decrypting chunk
 
@@ -244,7 +298,7 @@ gpg::gpg_export(id,secret = TRUE)
 
 Next the key itself in a `text` chunk.
 
-```{data key,format="text",output.var="key"}
+```{data key,output.file="key"}
 -----BEGIN PGP PRIVATE KEY BLOCK-----
 
 lQVYBF6A3p8BDADcaf7tveXZUpi0IfEpmYrPP8/OSXSh3iBkd5bdTvbq/FwLGIsD
@@ -329,15 +383,16 @@ Ng9Af4cf3nf9UzesAVbSy1gtvlZIyX0HwtZNVLNJSS4=
 ```
 
 ```{r importkey}
-tf = tempfile()
-writeLines(key,tf)
-gpg::gpg_import(tf)
-file.remove(tf)
+gpg::gpg_import("key")
 ```
 
 ## Data chunk
 
-```{data t3,echo=TRUE,format="RDS",encoding="gpg",output.var="t3"}
+```{r}
+tf = tempfile()
+```
+
+```{data t3,format="binary",encoding="gpg",output.file=tf}
 -----BEGIN PGP MESSAGE-----
 Version: GnuPG v2
 
@@ -359,29 +414,25 @@ oH9QuxSp8POmihI53+AbVA==
 ```
 
 ```{r}
-names(t3)
-t3
+d = readRDS(tf)
+d
 ```
 
 # Encoding a binary file for incorporation in Rmarkdown
 
 Below I demonstrate how to use the helper function `data_encode` to encode binary files for insertion in `data` chunks.
 
-```{r}
-saveRDS(t2,"test.RDS")
-```
-
 ## base64
 
 ```{r}
-data_encode("test.RDS","base64")
+data_encode(tf,"base64")
 ```
 
 ## GPG
 
 ```{r}
 id = gpg::gpg_list_keys("test@test.org")$id
-data_encode("test.RDS","gpg",options=list(receiver=id))
+data_encode(tf,"gpg",options=list(receiver=id))
 ```
 
 ## GPG saving to file
@@ -393,171 +444,16 @@ cat(readLines("test.gpg"),sep="\n")
 file.remove("test.gpg")
 ```
 
-
-# Test of arbitrary binary format with loader function
-
-Note that `echo=FALSE` is quite important here. *Perhaps I should force this on all data chunks?*
-
-```{data myimage,echo=FALSE,format=function(file) png::readPNG(file),encoding="base64",output.var="img"}
-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
-sidvx3Mx3AAAAABJRU5ErkJggg==
-```
-
-```{r}
-plot(1:2,1:2,type="n")
-rasterImage(img,1,1,2,2)
-```
-
-# Test of file data chunk
-
-`file` data chunks return the output filename to the variable named in `output.var`. If `format.ops` does not contain an element `filename`, then a temporary file is used.
-
-```{data myimagefn,echo=FALSE,format='file',encoding="base64",output.var="imgfn",format.ops=list(filename="test.png")}
-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
-sidvx3Mx3AAAAABJRU5ErkJggg==
-```
-
-![Test image file](`r imgfn`) 
-
-**Note:** Knitting will fail if `imgfn` points to a temporary file as the temporary file will be deleted before document passes through pandoc.
-
 # Test using external file
 
 When initially creating a document, it can be practical to store data in external files to keep the document itself small and readable. The `external.file` chunk option allows one to achieve this. The `external.file` must be the filename of a file containing text exactly as it would be incorporated into a `data` chunk (i.e., with encoding for binary files).
 
-```{data ext,format="text",output.var="ext",external.file="external.txt"}
+```{data ext,output.var="ext",external.file="external.txt"}
 ```
 
 ```{r}
 ext
 ```
-
 
 # Remove imported key
 
